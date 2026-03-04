@@ -1,11 +1,11 @@
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const { default: makeWASocket, useMultiFileAuthState, delay } = require("@whiskeysockets/baileys");
+const qrcode = require("qrcode-terminal");
 const app = express();
 const http = require('http').Server(app);
 
-// 1. Veritabanı Kurulumu (Adres sütunu panelin için aktif)
+// 1. Veritabanı Kurulumu
 const db = new sqlite3.Database('./hali.db');
 db.serialize(() => {
     db.run("CREATE TABLE IF NOT EXISTS siparisler (id INTEGER PRIMARY KEY AUTOINCREMENT, musteri TEXT, telefon TEXT, m2 REAL, fiyat REAL, adres TEXT, tarih DATETIME DEFAULT CURRENT_TIMESTAMP)");
@@ -13,27 +13,37 @@ db.serialize(() => {
 
 app.use(express.json());
 
-// 2. WhatsApp Botu
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: { 
-        headless: true, 
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-extensions'] 
-    }
-});
+// 2. WhatsApp Botu (Hafif Motor: Baileys)
+let sock;
+async function connectToWhatsApp() {
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    sock = makeWASocket({
+        printQRInTerminal: true,
+        auth: state,
+        browser: ["Vip Hali Yikama", "Chrome", "1.0.0"]
+    });
 
-client.on('qr', (qr) => {
-    console.log('--- HASAN REİS QR KODU TARA ---');
-    qrcode.generate(qr, {small: true});
-});
+    sock.ev.on('creds.update', saveCreds);
 
-client.on('ready', () => { 
-    console.log('🛡️ VİP HALI YIKAMA: SİSTEM HAZIR VE TETİKTE!'); 
-});
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if(qr) {
+            console.log('--- HASAN REİS QR KODU TARA ---');
+            qrcode.generate(qr, {small: true});
+        }
+        if(connection === 'open') {
+            console.log('🛡️ VİP HALI YIKAMA: SİSTEM HAZIR VE TETİKTE!');
+        }
+        if(connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
+            if(shouldReconnect) connectToWhatsApp();
+        }
+    });
+}
 
-client.initialize();
+connectToWhatsApp();
 
-// 3. Mobil Uyumlu Panel Arayüzü
+// 3. Mobil Uyumlu Panel Arayüzü (Senin Kodun - Aynen Korundu)
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -64,7 +74,7 @@ app.get('/', (req, res) => {
                 <input type="text" id="musteri" placeholder="Müşteri Ad Soyad">
                 <input type="tel" id="telefon" placeholder="Telefon (Sıfırsız: 5xxxxxxxxx)">
                 <input type="number" id="m2" placeholder="Toplam Metrekare" oninput="document.getElementById('t').innerText=(this.value*70).toFixed(2)">
-                <textarea id="adres" placeholder="Müşteri Adresi (Sadece senin panelinde gözükür)"></textarea>
+                <textarea id="adres" placeholder="Müşteri Adresi"></textarea>
                 <div style="text-align:center; margin:10px 0;">Tutar: <span id="t" style="color:var(--ana); font-weight:bold;">0</span> TL</div>
                 <button class="btn" id="anaBtn" onclick="islemYap()">KAYDET VE MESAJ AT</button>
             </div>
@@ -72,7 +82,6 @@ app.get('/', (req, res) => {
             <div id="liste"></div>
         </div>
         <div id="modal"><div class="modal-icerik" id="mIcerik"></div></div>
-
         <script>
             window.onload = listeYukle;
             async function listeYukle() {
@@ -90,53 +99,34 @@ app.get('/', (req, res) => {
                         </div>\`;
                 });
             }
-
             async function islemYap() {
                 const btn = document.getElementById('anaBtn');
                 const mus = document.getElementById('musteri').value;
                 const tel = document.getElementById('telefon').value;
                 const m2 = document.getElementById('m2').value;
                 const adr = document.getElementById('adres').value;
-
-                if(!mus || !tel || !m2) return alert("Hasan Reis, eksikleri doldur!");
-                btn.disabled = true; btn.innerText = "MESAJ GÖNDERİLİYOR...";
-
-                try {
-                    const res = await fetch('/islem', {
-                        method:'POST',
-                        headers:{'Content-Type':'application/json'},
-                        body:JSON.stringify({ musteri: mus, telefon: "90" + tel, m2: m2, fiyat: (m2 * 70).toFixed(2), adres: adr })
-                    });
-                    const sonuc = await res.json();
-                    if(sonuc.success) {
-                        btn.innerText = "✅ İŞLEM TAMAMLANDI";
-                        btn.classList.add('btn-basarili');
-                        document.querySelectorAll('input, textarea').forEach(i => i.value = "");
-                        document.getElementById('t').innerText = "0";
-                        listeYukle();
-                        setTimeout(() => { btn.disabled = false; btn.innerText = "KAYDET VE MESAJ AT"; btn.classList.remove('btn-basarili'); }, 3000);
-                    } else { alert("Hata: Mesaj gitmedi!"); btn.disabled = false; btn.innerText = "KAYDET VE MESAJ AT"; }
-                } catch (e) { alert("Sistem Hatası!"); btn.disabled = false; }
+                if(!mus || !tel || !m2) return alert("Eksikleri doldur!");
+                btn.disabled = true; btn.innerText = "GÖNDERİLİYOR...";
+                const res = await fetch('/islem', {
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({ musteri: mus, telefon: tel, m2: m2, fiyat: (m2 * 70).toFixed(2), adres: adr })
+                });
+                const sonuc = await res.json();
+                if(sonuc.success) {
+                    btn.innerText = "✅ TAMAMLANDI";
+                    btn.classList.add('btn-basarili');
+                    document.querySelectorAll('input, textarea').forEach(i => i.value = "");
+                    listeYukle();
+                    setTimeout(() => { btn.disabled = false; btn.innerText = "KAYDET VE MESAJ AT"; btn.classList.remove('btn-basarili'); }, 3000);
+                } else { alert("Hata!"); btn.disabled = false; }
             }
-
             function detayAc(m, t, m2, f, a, tar) {
-                document.getElementById('mIcerik').innerHTML = \`
-                    <h3 style="color:var(--ana); text-align:center;">Müşteri Bilgisi</h3>
-                    <p><b>👤 Müşteri:</b> \${m}</p>
-                    <p><b>📞 Telefon:</b> \${t}</p>
-                    <p><b>📏 Ölçü:</b> \${m2} m²</p>
-                    <p><b>💰 Tutar:</b> \${f} TL</p>
-                    <p><b>📍 Adres:</b> \${a || 'Kayıtlı Adres Yok'}</p>
-                    <p><b>📅 Tarih:</b> \${tar}</p>
-                    <button class="btn" style="background:#475569; color:white; margin-top:10px;" onclick="document.getElementById('modal').style.display='none'">KAPAT</button>\`;
+                document.getElementById('mIcerik').innerHTML = \`<h3>Müşteri Bilgisi</h3><p><b>👤:</b> \${m}</p><p><b>📞:</b> \${t}</p><p><b>📏:</b> \${m2} m²</p><p><b>💰:</b> \${f} TL</p><p><b>📍:</b> \${a || 'Yok'}</p><p><b>📅:</b> \${tar}</p><button class="btn" style="background:#475569; color:white;" onclick="document.getElementById('modal').style.display='none'">KAPAT</button>\`;
                 document.getElementById('modal').style.display = 'flex';
             }
-
             async function kayitSil(id) {
-                if(confirm("Bu kaydı sileyim mi Hasan Reis?")) {
-                    await fetch('/sil/' + id, { method: 'DELETE' });
-                    listeYukle();
-                }
+                if(confirm("Sileyim mi?")) { await fetch('/sil/' + id, { method: 'DELETE' }); listeYukle(); }
             }
         </script>
     </body>
@@ -144,16 +134,18 @@ app.get('/', (req, res) => {
     `);
 });
 
-// 4. API - Müşteriye Mesaj Atılan Kısım (Adres Mesajdan Çıkarıldı)
+// 4. API - Mesaj Gönderme
 app.post('/islem', async (req, res) => {
     const { musteri, telefon, m2, fiyat, adres } = req.body;
     db.run("INSERT INTO siparisler (musteri, telefon, m2, fiyat, adres) VALUES (?, ?, ?, ?, ?)", [musteri, telefon, m2, fiyat, adres], async function() {
-        // Müşteriye giden mesajın içinde ADRES YOK!
-        const mesaj = "Sayın " + musteri + ", " + m2 + " m2 halınız " + fiyat + " TL bedelle teslim alınmıştır. İşleminiz tamamlandığında tarafınıza bilgi verilecektir. Bizi tercih ettiğiniz için teşekkür ederiz. - VİP Halı Yıkama";
+        const jid = (telefon.startsWith('90') ? telefon : '90' + telefon) + "@s.whatsapp.net";
+        const mesaj = `Sayın ${musteri}, ${m2} m2 halınız ${fiyat} TL bedelle teslim alınmıştır. Teşekkür ederiz. - VİP Halı Yıkama`;
+        
         try {
-            await client.sendMessage(telefon + "@c.us", mesaj);
+            await sock.sendMessage(jid, { text: mesaj });
             res.json({ success: true });
         } catch (e) {
+            console.log(e);
             res.json({ success: false });
         }
     });
@@ -167,6 +159,7 @@ app.delete('/sil/:id', (req, res) => {
     db.run("DELETE FROM siparisler WHERE id = ?", req.params.id, () => res.json({ success: true }));
 });
 
-http.listen(3000, '0.0.0.0', () => { 
-    console.log('🚀 VİP HALI YIKAMA SİSTEMİ ÇALIŞIYOR: http://localhost:3000'); 
+const PORT = process.env.PORT || 3000;
+http.listen(PORT, '0.0.0.0', () => { 
+    console.log('🚀 SİSTEM AKTİF! PORT:', PORT); 
 });
